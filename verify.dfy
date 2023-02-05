@@ -236,16 +236,6 @@ predicate regularTape(tape: seq<TapeAlpha>) {
   forall j | (1 <= j < |tape|-1 && j != i) :: tape[j].TapeBit?
 }
 
-function regularTapeConfig(str: seq<TapeAlpha>): MachineConfig
-requires regularTape(str) {
-  var i :| 1 <= i < |str|-1 && str[i].TapeHead?;
-  MachineConfig(
-    position := i,
-    color := str[i].tapeHeadState,
-    tape := set j | 0 <= j < |str| && bitIsOne(str[j]) :: j
-  )
-}
-
 datatype RewriteRule = MkRewriteRule(before: TapeString, after: TapeString)
 
 function performRewriteAt(s: TapeString, rule: RewriteRule, at: nat): (r: TapeString)
@@ -301,11 +291,27 @@ ensures tape[r].TapeHead? && elsewhereAreBits(tape, r)
   out
 }
 
-predicate singleHeadRule(rule: RewriteRule) {
-  singleHead(rule.before) && singleHead(rule.after)
+predicate singleHeadRule(rule: RewriteRule)
+decreases |rule.before| {
+  ( // If they have a common ending...
+    |rule.before| >= 2 &&
+    |rule.after| >= 2 &&
+    rule.before[|rule.before|-1] == rule.after[|rule.after|-1] &&
+    |rule.after| >= |rule.before| &&
+    singleHeadRule(MkRewriteRule(rule.before[..|rule.before|-1], rule.after[..|rule.after|-1]))
+  ) ||
+  ( // Or a common beginning...
+    |rule.before| >= 2 &&
+    |rule.after| >= 2 &&
+    rule.before[0] == rule.after[0] &&
+    |rule.after| >= |rule.before| &&
+    singleHeadRule(MkRewriteRule(rule.before[1..], rule.after[1..]))
+  ) ||
+  (singleHead(rule.before) && singleHead(rule.after))
 }
 
 lemma singleHeadRulesPreservesRegularityAt(tape: TapeString, rule: RewriteRule, at: nat)
+decreases |rule.before|
 requires regularTape(tape)
 requires singleHeadRule(rule)
 requires 0 <= at <= |tape| - |rule.before|
@@ -313,10 +319,42 @@ requires |rule.before| > 0
 requires tape[at .. at + |rule.before|] == rule.before
 ensures regularTape(performRewriteAt(tape, rule, at))
 {
+  
+  var rewritten := performRewriteAt(tape, rule, at);
+  assert |rewritten| == at + |rule.after| + |tape[at + |rule.before|..]|;
+
   reveal singleHead();
+
+  if |rule.before| >= 2 &&
+    |rule.after| >= 2 &&
+    rule.before[|rule.before|-1] == rule.after[|rule.after|-1] &&
+    |rule.after| >= |rule.before| &&
+    singleHeadRule(MkRewriteRule(rule.before[..|rule.before|-1], rule.after[..|rule.after|-1]))
+  {
+    assert |rewritten| >= 3;
+    var shrinkRule := MkRewriteRule(rule.before[..|rule.before|-1], rule.after[..|rule.after|-1]);
+    singleHeadRulesPreservesRegularityAt(tape, shrinkRule, at);
+    assert performRewriteAt(tape, shrinkRule, at) == rewritten;
+    assert regularTape(rewritten);
+    return;
+  }
+
+  if |rule.before| >= 2 &&
+    |rule.after| >= 2 &&
+    rule.before[0] == rule.after[0] &&
+    |rule.after| >= |rule.before| &&
+    singleHeadRule(MkRewriteRule(rule.before[1..], rule.after[1..]))
+  {
+    assert |rewritten| >= 3;
+    var shrinkRule := MkRewriteRule(rule.before[1..], rule.after[1..]);
+    singleHeadRulesPreservesRegularityAt(tape, shrinkRule, at+1);
+    assert performRewriteAt(tape, shrinkRule, at+1) == rewritten;
+    assert regularTape(rewritten);
+    return;
+  }
+
   reveal elsewhereAreBits();
 
-  var rewritten := performRewriteAt(tape, rule, at);
   assert singleHeadTrigger(0) == 0;
   assert rule.before[0] != TapeEnd;
   assert |rewritten| == at + |rule.after| + |tape[at + |rule.before|..]|;
@@ -580,7 +618,6 @@ predicate excludeChainedBitTrigger<V>(p: (V, V), x: TapeAlpha) { true }
 function method {:opaque true} dfaAcceptedSubsetExcludeChainedBit<V(!new)>(pairs: set<(V, V)>, d: WholeDFA<V>): (newExclude: set<(V, V)>)
 requires pairsInFollow(d, pairs)
 ensures newExclude <= pairs
-// ensures forall p, x | p in pairs && x in d.follow[p.0] && x in d.follow[p.1] && (d.follow[p.0][x], d.follow[p.1][x]) !in pairs :: p in newExclude 
 {
   var allSym := methodAllTapeAlpha();
   methodAllTapeAlphaWorks();
@@ -699,3 +736,256 @@ ensures pairsAreSubsumed(d, pairs)
   return pairs;
 }
 
+
+////////////////////////////////////////////////////////////////////////////////////////////////
+// This next section combines the rewriting logic with the given program.
+
+function regularTapeConfig(str: (int, seq<TapeAlpha>)): MachineConfig
+requires regularTape(str.1) {
+  var i :| 1 <= i < |str.1|-1 && str.1[i].TapeHead?;
+  MachineConfig(
+    position := i + str.0,
+    color := str.1[i].tapeHeadState,
+    tape := set j | 0 <= j < |str.1| && bitIsOne(str.1[j]) :: j + str.0
+  )
+}
+
+const InitialTapeString: (int, TapeString) := (-1, [TapeEnd, TapeHead(CA, B0), TapeEnd]);
+
+lemma initialTapeStringIsRegular() ensures regularTape(InitialTapeString.1) {
+  var tape := InitialTapeString.1;
+  var idx := 1;
+  assert tape[idx].TapeHead?;
+  assert tape[0].TapeEnd?;
+  assert tape[2].TapeEnd?;
+}
+
+lemma initialTapeString()
+ensures regularTape(InitialTapeString.1)
+ensures regularTapeConfig(InitialTapeString) == InitialMachineConfig {
+  initialTapeStringIsRegular();
+}
+
+// [Ah] t --> w [Bt]
+lemma rewriteRuleForMoveRightInto(program: Program, input: Input, action: Action, s: (int, TapeString), at: nat, b: Bit)
+requires regularTape(s.1)
+requires input in program
+requires action == program[input]
+requires 0 < at <= |s.1| - 2
+requires action.move == R
+requires s.1[at .. at + 2] == [TapeHead(input.color, input.head), TapeBit(b)]
+ensures configStep(program, regularTapeConfig(s)).NextConfig?
+ensures 
+  var rewritten := performRewriteAt(s.1, MkRewriteRule([TapeHead(input.color, input.head), TapeBit(b)], [TapeBit(action.write), TapeHead(action.nextState, b)]), at);
+  regularTape(rewritten) &&
+  regularTapeConfig((s.0, rewritten)) == configStep(program, regularTapeConfig(s)).nextConfig
+{
+  var rule := MkRewriteRule([TapeHead(input.color, input.head), TapeBit(b)], [TapeBit(action.write), TapeHead(action.nextState, b)]);
+  reveal singleHead();
+  reveal elsewhereAreBits();
+  assert rule.before[0].TapeHead?;
+  forall i | 0 <= i < |rule.before| && i != 0 ensures rule.before[i].TapeBit? {}
+  assert singleHead(rule.before);
+  assert rule.after[1].TapeHead?;
+  forall i | 0 <= i < |rule.after| && i != 1 ensures rule.after[i].TapeBit? {}
+  assert singleHead(rule.after);
+
+  var rewritten := performRewriteAt(s.1, rule, at);
+  singleHeadRulesPreservesRegularityAt(s.1, rule, at);
+  assert regularTape(rewritten);
+
+  var configBefore := regularTapeConfig(s);
+  var configStepBefore := configStep(program, configBefore).nextConfig;
+  var configAfter := regularTapeConfig((s.0, rewritten));
+  assert configAfter.position == configStepBefore.position;
+  assert configAfter.color == configStepBefore.color;
+  forall x ensures x in configAfter.tape <==> x in configStepBefore.tape {
+    if x == configBefore.position {
+      assert x in configStepBefore.tape <==> action.write == B1;
+      assert x in configAfter.tape <==> rewritten[at] == TapeBit(B1);
+      assert x in configAfter.tape <==> x in configStepBefore.tape;
+    } else if x == configBefore.position + 1 {
+      assert x in configStepBefore.tape <==> x in configBefore.tape;
+      assert x in configAfter.tape <==> rewritten[at+1] == TapeHead(action.nextState, B1);
+      assert s.1[at+1] == TapeBit(b);
+      assert x in configAfter.tape <==> x in configStepBefore.tape;
+    } else {
+      assert x in configStepBefore.tape <==> x in configBefore.tape;
+      assert x in configBefore.tape <==> (0 <= x-s.0 < |s.1| && s.1[x - s.0] == TapeBit(B1));
+      assert x in configAfter.tape <==> (0 <= x-s.0 < |s.1| && rewritten[x - s.0] == TapeBit(B1));
+      assert x in configAfter.tape <==> x in configStepBefore.tape;
+    }
+  }
+  assert configAfter.tape == configStepBefore.tape;
+  assert configAfter == configStepBefore;
+}
+
+// [Ah] $ --> w [B0] $
+lemma rewriteRuleForMoveRightEnd(program: Program, input: Input, action: Action, s: (int, TapeString), at: nat)
+requires regularTape(s.1)
+requires input in program
+requires action == program[input]
+requires 0 < at <= |s.1| - 2
+requires action.move == R
+requires s.1[at .. at + 2] == [TapeHead(input.color, input.head), TapeEnd]
+ensures configStep(program, regularTapeConfig(s)).NextConfig?
+ensures 
+  var rewritten := performRewriteAt(s.1, MkRewriteRule([TapeHead(input.color, input.head), TapeEnd], [TapeBit(action.write), TapeHead(action.nextState, B0), TapeEnd]), at);
+  regularTape(rewritten) &&
+  regularTapeConfig((s.0, rewritten)) == configStep(program, regularTapeConfig(s)).nextConfig
+{
+  var rule := MkRewriteRule([TapeHead(input.color, input.head), TapeEnd], [TapeBit(action.write), TapeHead(action.nextState, B0), TapeEnd]);
+  reveal singleHead();
+  reveal elsewhereAreBits();
+  assert rule.before[..|rule.before|-1][0].TapeHead?;
+  forall i | 0 <= i < |rule.before|-1 && i != 0 ensures rule.before[i].TapeBit? {}
+  assert singleHead(rule.before[..|rule.before|-1]);
+  assert rule.after[..|rule.after|-1][1].TapeHead?;
+  forall i | 0 <= i < |rule.after|-1 && i != 1 ensures rule.after[i].TapeBit? {}
+  assert singleHead(rule.after[..|rule.after|-1]);
+  assert singleHeadRule(rule);
+
+  var rewritten := performRewriteAt(s.1, rule, at);
+  singleHeadRulesPreservesRegularityAt(s.1, rule, at);
+  assert regularTape(rewritten);
+
+  var configBefore := regularTapeConfig(s);
+  var configStepBefore := configStep(program, configBefore).nextConfig;
+  var configAfter := regularTapeConfig((s.0, rewritten));
+  assert configAfter.position == configStepBefore.position;
+  assert configAfter.color == configStepBefore.color;
+  forall x ensures x in configAfter.tape <==> x in configStepBefore.tape {
+    if x == configBefore.position {
+      assert x in configStepBefore.tape <==> action.write == B1;
+      assert x in configAfter.tape <==> rewritten[at] == TapeBit(B1);
+      assert x in configAfter.tape <==> x in configStepBefore.tape;
+    } else if x == configBefore.position + 1 {
+      assert x in configStepBefore.tape <==> x in configBefore.tape;
+      assert x in configAfter.tape <==> rewritten[at+1] == TapeHead(action.nextState, B1);
+      assert s.1[at+1] == TapeEnd;
+      assert x in configAfter.tape <==> x in configStepBefore.tape;
+    } else {
+      assert x in configStepBefore.tape <==> x in configBefore.tape;
+      assert x in configBefore.tape <==> (0 <= x-s.0 < |s.1| && s.1[x - s.0] == TapeBit(B1));
+      assert x in configAfter.tape <==> (0 <= x-s.0 < |s.1| && rewritten[x - s.0] == TapeBit(B1));
+      assert x in configAfter.tape <==> x in configStepBefore.tape;
+    }
+  }
+  assert configAfter.tape == configStepBefore.tape;
+  assert configAfter == configStepBefore;
+}
+
+// t [Ah] --> [Bt] w
+lemma rewriteRuleForMoveLeftInto(program: Program, input: Input, action: Action, s: (int, TapeString), at: nat, b: Bit)
+requires regularTape(s.1)
+requires input in program
+requires action == program[input]
+requires 0 < at <= |s.1| - 2
+requires action.move == L
+requires s.1[at .. at + 2] == [TapeBit(b), TapeHead(input.color, input.head)]
+ensures configStep(program, regularTapeConfig(s)).NextConfig?
+ensures 
+  var rewritten := performRewriteAt(s.1, MkRewriteRule([TapeBit(b), TapeHead(input.color, input.head)], [TapeHead(action.nextState, b), TapeBit(action.write)]), at);
+  regularTape(rewritten) &&
+  regularTapeConfig((s.0, rewritten)) == configStep(program, regularTapeConfig(s)).nextConfig
+{
+  var rule := MkRewriteRule([TapeBit(b), TapeHead(input.color, input.head)], [TapeHead(action.nextState, b), TapeBit(action.write)]);
+  reveal singleHead();
+  reveal elsewhereAreBits();
+  assert rule.before[1].TapeHead?;
+  forall i | 0 <= i < |rule.before| && i != 1 ensures rule.before[i].TapeBit? {}
+  assert singleHead(rule.before);
+  assert rule.after[0].TapeHead?;
+  forall i | 0 <= i < |rule.after| && i != 0 ensures rule.after[i].TapeBit? {}
+  assert singleHead(rule.after);
+
+  var rewritten := performRewriteAt(s.1, rule, at);
+  singleHeadRulesPreservesRegularityAt(s.1, rule, at);
+  assert regularTape(rewritten);
+
+  var configBefore := regularTapeConfig(s);
+  var configStepBefore := configStep(program, configBefore).nextConfig;
+  var configAfter := regularTapeConfig((s.0, rewritten));
+  assert configAfter.position == configStepBefore.position;
+  assert configAfter.color == configStepBefore.color;
+  forall x ensures x in configAfter.tape <==> x in configStepBefore.tape {
+    if x == configBefore.position {
+      assert x in configStepBefore.tape <==> action.write == B1;
+      assert x in configAfter.tape <==> rewritten[at+1] == TapeBit(B1);
+      assert x in configAfter.tape <==> x in configStepBefore.tape;
+    } else if x == configBefore.position - 1 {
+      assert x in configStepBefore.tape <==> x in configBefore.tape;
+      assert x in configAfter.tape <==> rewritten[at] == TapeHead(action.nextState, B1);
+      assert s.1[at] == TapeBit(b);
+      assert x in configAfter.tape <==> x in configStepBefore.tape;
+    } else {
+      assert x in configStepBefore.tape <==> x in configBefore.tape;
+      assert x in configBefore.tape <==> (0 <= x-s.0 < |s.1| && s.1[x - s.0] == TapeBit(B1));
+      assert x in configAfter.tape <==> (0 <= x-s.0 < |s.1| && rewritten[x - s.0] == TapeBit(B1));
+      assert x in configAfter.tape <==> x in configStepBefore.tape;
+    }
+  }
+  assert configAfter.tape == configStepBefore.tape;
+  assert configAfter == configStepBefore;
+}
+
+// $ [Ah] --> $ [B0] w
+lemma rewriteRuleForMoveLeftEnd(program: Program, input: Input, action: Action, s: (int, TapeString), at: nat)
+requires regularTape(s.1)
+requires input in program
+requires action == program[input]
+requires 0 < at <= |s.1| - 2
+requires action.move == L
+requires s.1[at .. at + 2] == [TapeEnd, TapeHead(input.color, input.head)]
+ensures configStep(program, regularTapeConfig(s)).NextConfig?
+ensures 
+  var rewritten := performRewriteAt(s.1, MkRewriteRule([TapeEnd, TapeHead(input.color, input.head)], [TapeEnd, TapeHead(action.nextState, B0), TapeBit(action.write)]), at);
+  regularTape(rewritten) &&
+  regularTapeConfig((s.0-20, rewritten)) == configStep(program, regularTapeConfig(s)).nextConfig
+{
+  var rule := MkRewriteRule([TapeEnd, TapeHead(input.color, input.head)], [TapeEnd, TapeHead(action.nextState, B0), TapeBit(action.write)]);
+  reveal singleHead();
+  reveal elsewhereAreBits();
+  assert rule.before[..|rule.before|-1][0].TapeHead?;
+  forall i | 0 <= i < |rule.before|-1 && i != 0 ensures rule.before[i].TapeBit? {}
+  assert singleHead(rule.before[..|rule.before|-1]);
+  assert rule.after[..|rule.after|-1][1].TapeHead?;
+  forall i | 0 <= i < |rule.after|-1 && i != 1 ensures rule.after[i].TapeBit? {}
+  assert singleHead(rule.after[..|rule.after|-1]);
+  assert singleHeadRule(rule);
+
+  var rewritten := performRewriteAt(s.1, rule, at);
+  singleHeadRulesPreservesRegularityAt(s.1, rule, at);
+  assert regularTape(rewritten);
+
+  var configBefore := regularTapeConfig(s);
+  var configStepBefore := configStep(program, configBefore).nextConfig;
+  var configAfter := regularTapeConfig((s.0, rewritten));
+  assert configAfter.position == configStepBefore.position;
+  assert configAfter.color == configStepBefore.color;
+  forall x ensures x in configAfter.tape <==> x in configStepBefore.tape {
+    if x == configBefore.position {
+      assert x in configStepBefore.tape <==> action.write == B1;
+      assert x in configAfter.tape <==> rewritten[at] == TapeBit(B1);
+      assert x in configAfter.tape <==> x in configStepBefore.tape;
+    } else if x == configBefore.position + 1 {
+      assert x in configStepBefore.tape <==> x in configBefore.tape;
+      assert x in configAfter.tape <==> rewritten[at+1] == TapeHead(action.nextState, B1);
+      assert s.1[at+1] == TapeEnd;
+      assert x in configAfter.tape <==> x in configStepBefore.tape;
+    } else {
+      assert x in configStepBefore.tape <==> x in configBefore.tape;
+      assert x in configBefore.tape <==> (0 <= x-s.0 < |s.1| && s.1[x - s.0] == TapeBit(B1));
+      assert x in configAfter.tape <==> (0 <= x-s.0 < |s.1| && rewritten[x - s.0] == TapeBit(B1));
+      assert x in configAfter.tape <==> x in configStepBefore.tape;
+    }
+  }
+  assert configAfter.tape == configStepBefore.tape;
+  assert configAfter == configStepBefore;
+
+  assert regularTapeConfig((s.0-20, rewritten)) == configStep(program, regularTapeConfig(s)).nextConfig;
+  assert regularTapeConfig((s.0-50, rewritten)) == configStep(program, regularTapeConfig(s)).nextConfig;
+  assert regularTapeConfig((s.0-20, rewritten)).position - regularTapeConfig((s.0-50, rewritten)).position == 0;
+  assert regularTapeConfig((s.0-20, rewritten)).position - regularTapeConfig((s.0-50, rewritten)).position == (s.0 - 20) - (s.0 - 50);
+  assert 0 == 30;
+}
