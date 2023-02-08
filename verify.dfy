@@ -391,11 +391,23 @@ ensures regularTape(performRewriteAt(tape, rule, at))
 
 datatype DFA<Vertex(==)> = MkDFA(
   follow: map<Vertex, map<TapeAlpha, Vertex>>,
+  vertexList: seq<Vertex>,
   accept: set<Vertex>
 )
 
 predicate {:opaque true} wholeDfa<Vertex>(dfa: DFA<Vertex>) {
-forall v | v in dfa.follow :: forall x :: x in dfa.follow[v] && dfa.follow[v][x] in dfa.follow
+(forall v | v in dfa.follow :: forall x :: x in dfa.follow[v] && dfa.follow[v][x] in dfa.follow)
+&&
+(forall v | v in dfa.follow :: v in dfa.follow <==> v in dfa.vertexList)
+&&
+(forall v | v in dfa.vertexList :: v in dfa.follow <==> v in dfa.vertexList)
+}
+
+lemma wholeDfaVertexEquivalence<Vertex>(dfa: WholeDFA<Vertex>)
+ensures (forall v | v in dfa.follow :: v in dfa.follow <==> v in dfa.vertexList)
+ensures (forall v | v in dfa.vertexList :: v in dfa.follow <==> v in dfa.vertexList)
+{
+  reveal wholeDfa();
 }
 
 lemma wholeDfaWorks<V>(d: WholeDFA<V>, a: V, x: TapeAlpha) requires a in d.follow ensures x in d.follow[a] && d.follow[a][x] in d.follow {
@@ -404,8 +416,9 @@ lemma wholeDfaWorks<V>(d: WholeDFA<V>, a: V, x: TapeAlpha) requires a in d.follo
 
 type WholeDFA<Vertex> = dfa: DFA | wholeDfa(dfa) witness *
 
-function followStringFrom<Vertex>(d: WholeDFA<Vertex>, tape: TapeString, from: Vertex): Vertex
-requires from in d.follow {
+function method followStringFrom<Vertex>(d: WholeDFA<Vertex>, tape: TapeString, from: Vertex): (answer: Vertex)
+requires from in d.follow
+ensures answer in d.follow {
   if |tape| == 0 then from else
   reveal wholeDfa();
   followStringFrom(d, tape[1..], d.follow[from][tape[0]])
@@ -417,6 +430,34 @@ requires from in d.follow
   followStringFrom(d, tape, from) in d.accept
 }
 
+lemma stringMatchesDFAFromEventually<Vertex>(d: WholeDFA<Vertex>, tape: TapeString, from: Vertex, index: nat)
+requires from in d.follow
+requires 0 <= index <= |tape|
+ensures stringMatchesDFAFrom(d, tape, from) <==> stringMatchesDFAFrom(d, tape[index..], followStringFrom(d, tape[..index], from))
+{
+  if index == 0 {
+    // ... done
+  } else {
+    wholeDfaWorks(d, from, tape[0]);
+    var nextV := d.follow[from][tape[0]];
+    assert stringMatchesDFAFrom(d, tape, from) <==> stringMatchesDFAFrom(d, tape[1..], nextV);
+    stringMatchesDFAFromEventually(d, tape[1..], nextV, index-1);
+    assert tape[1..index] == tape[1..][..index-1];
+  }
+}
+
+lemma stringMatchesSink<Vertex>(d: WholeDFA<Vertex>, tape: TapeString, sink: Vertex)
+requires sink in d.follow
+requires forall x: TapeAlpha :: sink in d.follow && x in d.follow[sink] && d.follow[sink][x] == sink
+ensures stringMatchesDFAFrom(d, tape, sink) <==> sink in d.accept
+{
+  if |tape| == 0 {
+    // done
+  } else {
+    wholeDfaWorks(d, sink, tape[0]);
+    stringMatchesSink(d, tape[1..], sink);
+  }
+}
 
 // This is a utility method which checks (at runtime) that a predicate
 // holds for each element of a set.
@@ -438,6 +479,30 @@ ensures okay ==> forall x | x in domain :: func(x)
     leftover := leftover - {x};
   }
   return true;
+}
+
+predicate {:opaque true} funcForAll<T>(domain: seq<T>, func: T --> bool)
+requires forall x | x in domain :: func.requires(x)
+{
+  forall x | x in domain :: func(x)
+}
+
+lemma {:opaque true} instanceFuncForAll<T>(domain: seq<T>, func: T --> bool, x: T)
+requires forall x | x in domain :: func.requires(x)
+requires funcForAll(domain, func)
+requires x in domain
+ensures func(x)
+{
+  reveal funcForAll();
+}
+
+function method {:opaque true} checkAllRecursive<T(!new)>(domain: seq<T>, func: T --> bool): (okay: bool)
+requires forall x | x in domain :: func.requires(x)
+ensures okay ==> funcForAll(domain, func)
+{
+  reveal funcForAll();
+  if |domain| == 0 then true else
+  func(domain[0]) && checkAllRecursive(domain[1..], func)
 }
 
 predicate {:opaque} vertexSubsumption<Vertex>(d: WholeDFA<Vertex>, a: Vertex, b: Vertex)
@@ -990,4 +1055,502 @@ ensures
   }
   assert configAfter.tape == configStepBefore.tape;
   assert configAfter == configStepBefore;
+}
+
+function method programRewriteRulesRightMiddle(program: Program): set<(int, Input, Action, RewriteRule)> {
+  var bits := [B0, B1];
+  (set input, b | b in bits && input in program && program[input].move == R :: var action := program[input]; (0, input, action, MkRewriteRule([TapeHead(input.color, input.head), TapeBit(b)], [TapeBit(action.write), TapeHead(action.nextState, b)])))
+}
+
+function method programRewriteRulesRightEnd(program: Program): set<(int, Input, Action, RewriteRule)> {
+  (set input | input in program && program[input].move == R :: var action := program[input]; (0, input, action, MkRewriteRule([TapeHead(input.color, input.head), TapeEnd], [TapeBit(action.write), TapeHead(action.nextState, B0), TapeEnd])))
+}
+
+function method programRewriteRulesLeftMiddle(program: Program): set<(int, Input, Action, RewriteRule)> {
+  var bits := [B0, B1];
+  (set input, b | b in bits && input in program && program[input].move == L :: var action := program[input]; (0, input, action, MkRewriteRule([TapeBit(b), TapeHead(input.color, input.head)], [TapeHead(action.nextState, b), TapeBit(action.write)])))
+}
+
+function method programRewriteRulesLeftEnd(program: Program): set<(int, Input, Action, RewriteRule)> {
+  (set input | input in program && program[input].move == L :: var action := program[input]; (-1, input, action, MkRewriteRule([TapeEnd, TapeHead(input.color, input.head)], [TapeEnd, TapeHead(action.nextState, B0), TapeBit(action.write)])))
+}
+
+function method {:opaque true} programRewriteRules(program: Program): set<(int, Input, Action, RewriteRule)> {
+  programRewriteRulesRightMiddle(program)
+  +
+  programRewriteRulesRightEnd(program)
+  +
+  programRewriteRulesLeftMiddle(program)
+  +
+  programRewriteRulesLeftEnd(program)
+}
+lemma programRewriteRuleRightMiddle(program: Program, input: Input, action: Action, b: Bit)
+requires input in program
+requires action == program[input]
+requires action.move == R
+ensures (0, input, action, MkRewriteRule([TapeHead(input.color, input.head), TapeBit(b)], [TapeBit(action.write), TapeHead(action.nextState, b)])) in programRewriteRules(program)
+{
+  reveal programRewriteRules();
+  assert b in [B0, B1];
+}
+
+lemma programRewriteRuleRightEnd(program: Program, input: Input, action: Action)
+requires input in program
+requires action == program[input]
+requires action.move == R
+ensures (0, input, action, MkRewriteRule([TapeHead(input.color, input.head), TapeEnd], [TapeBit(action.write), TapeHead(action.nextState, B0), TapeEnd])) in programRewriteRules(program)
+{
+  reveal programRewriteRules();
+}
+
+lemma programRewriteRuleLeftMiddle(program: Program, input: Input, action: Action, b: Bit)
+requires input in program
+requires action == program[input]
+requires action.move == L
+ensures (0, input, action, MkRewriteRule([TapeBit(b), TapeHead(input.color, input.head)], [TapeHead(action.nextState, b), TapeBit(action.write)])) in programRewriteRules(program)
+{
+  reveal programRewriteRules();
+  assert b in [B0, B1];
+}
+
+
+lemma programRewriteRuleLeftEnd(program: Program, input: Input, action: Action)
+requires input in program
+requires action == program[input]
+requires action.move == L
+ensures (-1, input, action, MkRewriteRule([TapeEnd, TapeHead(input.color, input.head)], [TapeEnd, TapeHead(action.nextState, B0), TapeBit(action.write)])) in programRewriteRules(program)
+{
+  reveal programRewriteRules();
+}
+
+
+lemma programRewriteRulesAdvance(program: Program, tape: (int, TapeString), rule: (int, Input, Action, RewriteRule), at: int)
+requires regularTape(tape.1);
+requires rule in programRewriteRules(program)
+requires 0 <= at <= |tape.1| - |rule.3.before| && tape.1[at .. at + |rule.3.before|] == rule.3.before
+ensures configInput(regularTapeConfig(tape)) in program
+ensures regularTape(performRewriteAt(tape.1, rule.3, at))
+ensures regularTapeConfig((tape.0 + rule.0, performRewriteAt(tape.1, rule.3, at))) == configStep(program, regularTapeConfig(tape)).nextConfig
+{
+  var input := rule.1;
+  var action := rule.2;
+  var beforeConfig := regularTapeConfig(tape);
+  reveal programRewriteRules();
+  assert |rule.3.before| == 2;
+  if rule.3.before[0].TapeHead? {
+    assert action.move == R;
+    // Moving right
+    if rule.3.before[1].TapeBit? {
+      // program: Program, input: Input, action: Action, s: (int, TapeString), at: nat, b: Bit
+      rewriteRuleForMoveRightInto(program, input, action, tape, at, rule.3.before[1].tapeBit);
+    } else {
+      rewriteRuleForMoveRightEnd(program, input, action, tape, at);
+    }
+  } else {
+    assert action.move == L;
+    // Moving left
+    if rule.3.before[0].TapeBit? {
+      // program: Program, input: Input, action: Action, s: (int, TapeString), at: nat, b: Bit
+      rewriteRuleForMoveLeftInto(program, input, action, tape, at, rule.3.before[0].tapeBit);
+    } else {
+      rewriteRuleForMoveLeftEnd(program, input, action, tape, at);
+    }
+  }
+}
+
+
+predicate forwardClosedSet(program: Program, accepting: ((int, TapeString)) --> bool) {
+ (forall t: (int, TapeString) | regularTape(t.1) :: accepting.requires(t))
+&& regularTape(InitialTapeString.1)
+// We must accept the initial tape:
+&& accepting(InitialTapeString)
+// If we accept a string, it must not be in a halting config:
+&& (forall t: (int, TapeString) | regularTape(t.1) && accepting(t) :: configInput(regularTapeConfig(t)) in program)
+// If we accept a string, then after rewriting, we still accept it.
+&& (forall t: (int, TapeString) | regularTape(t.1) && accepting(t) ::
+  exists rule, at ::
+    rule in programRewriteRules(program) && 0 <= at <= |t.1| - |rule.3.before|&&
+    t.1[at .. at + |rule.3.before|] == rule.3.before &&
+    var rewritten := performRewriteAt(t.1, rule.3, at);
+    regularTape(rewritten) &&
+    accepting((t.0 + rule.0, rewritten)))
+}
+
+
+lemma {:opaque true} closedStringSetImpliesLooping(program: Program, accepting: ((int, TapeString)) --> bool)
+requires forwardClosedSet(program, accepting)
+ensures programLoopsForever(program)
+{
+  forall n: nat ensures programConfigIter(program, n).NextConfig? {
+    closedStringSetImpliesLoopingInduction(program, accepting, n);
+  }
+}
+
+lemma {:opaque true} closedStringSetImpliesLoopingInduction(program: Program, accepting: ((int, TapeString)) --> bool, n: nat)
+requires forall t: (int, TapeString) | regularTape(t.1) :: accepting.requires(t)
+requires regularTape(InitialTapeString.1)
+// We must accept the initial tape:
+requires accepting(InitialTapeString)
+// If we accept a string, it must not be in a halting config:
+requires forall t: (int, TapeString) | regularTape(t.1) && accepting(t) :: configInput(regularTapeConfig(t)) in program
+// If we accept a string, then after rewriting, we still accept it.
+requires forall t: (int, TapeString) | regularTape(t.1) && accepting(t) ::
+  exists rule, at ::
+    rule in programRewriteRules(program) && 0 <= at <= |t.1| - |rule.3.before| &&
+    t.1[at .. at + |rule.3.before|] == rule.3.before &&
+    var rewritten := performRewriteAt(t.1, rule.3, at);
+    regularTape(rewritten) &&
+    accepting((t.0 + rule.0, rewritten))
+
+ensures programConfigIter(program, n).NextConfig?
+ensures exists f: (int, TapeString) :: regularTape(f.1) && regularTapeConfig(f) == programConfigIter(program, n).nextConfig && accepting(f)
+{
+  if n == 0 {
+    initialTapeString();
+    assert accepting(InitialTapeString);
+    assert programConfigIter(program, n).NextConfig?;
+    assert exists f: (int, TapeString) :: regularTape(f.1) && regularTapeConfig(f) == programConfigIter(program, n).nextConfig && accepting(f);
+  } else {
+    closedStringSetImpliesLoopingInduction(program, accepting, n-1);
+
+    var prevF: (int, TapeString) :| regularTape(prevF.1) && regularTapeConfig(prevF) == programConfigIter(program, n-1).nextConfig && accepting(prevF);
+
+    var rule, at :| rule in programRewriteRules(program) && 0 <= at <= |prevF.1| - |rule.3.before| &&
+      prevF.1[at .. at + |rule.3.before|] == rule.3.before &&
+      var rewritten := performRewriteAt(prevF.1, rule.3, at);
+      regularTape(rewritten) &&
+      accepting((prevF.0 + rule.0, rewritten));
+
+    var nextF := performRewriteAt(prevF.1, rule.3, at);
+    programRewriteRulesAdvance(program, prevF, rule, at);
+
+    assert programConfigIter(program, n).NextConfig?;
+    assert exists f: (int, TapeString) :: regularTape(f.1) && regularTapeConfig(f) == programConfigIter(program, n).nextConfig && accepting(f);
+  }
+}
+
+predicate isSinkAccept<V>(dfa: WholeDFA<V>, sinkAccept: V) {
+  sinkAccept in dfa.follow && sinkAccept in dfa.accept && forall sym: TapeAlpha :: wholeDfaWorks(dfa, sinkAccept, sym); dfa.follow[sinkAccept][sym] == sinkAccept
+}
+predicate isSinkReject<V>(dfa: WholeDFA<V>, sinkReject: V) {
+  sinkReject in dfa.follow && sinkReject !in dfa.accept && forall sym: TapeAlpha :: wholeDfaWorks(dfa, sinkReject, sym); dfa.follow[sinkReject][sym] == sinkReject
+}
+
+function verifyPreservesRewriteProofTrigger<V>(v: V): int { 0 }
+
+predicate {:opaque true} rewriteIntoPairs<V(!new)>(dfa: WholeDFA<V>, rule: RewriteRule, pairs: set<(V, V)>) {
+  forall v | v in dfa.follow ::
+    (followStringFrom(dfa, rule.before, v), followStringFrom(dfa, rule.after, v)) in pairs
+}
+
+lemma {:opaque true} rewriteIntoPairsInstance<V(!new)>(dfa: WholeDFA<V>, rule: RewriteRule, pairs: set<(V, V)>, v: V)
+requires v in dfa.follow
+requires rewriteIntoPairs(dfa, rule, pairs)
+ensures (followStringFrom(dfa, rule.before, v), followStringFrom(dfa, rule.after, v)) in pairs
+{
+  reveal rewriteIntoPairs();
+}
+
+lemma verifyPreservesRewriteProofHelper1<V(!new)>(dfa: WholeDFA<V>, rule: RewriteRule, pairs: set<(V, V)>, isOkay: bool)
+requires isOkay ==> funcForAll(dfa.vertexList, (v: V) requires v in dfa.vertexList => wholeDfaVertexEquivalence(dfa); (followStringFrom(dfa, rule.before, v), followStringFrom(dfa, rule.after, v)) in pairs)
+ensures isOkay ==> rewriteIntoPairs(dfa, rule, pairs)
+{
+  if isOkay {
+    reveal funcForAll();
+    reveal rewriteIntoPairs();
+    forall v | v in dfa.follow ensures (followStringFrom(dfa, rule.before, v), followStringFrom(dfa, rule.after, v)) in pairs {
+      wholeDfaVertexEquivalence(dfa);
+      assert v in dfa.vertexList;
+    }
+  }
+}
+
+lemma {:opaque true} verifyPreservesRewriteProof<V(!new, ==)>(dfa: WholeDFA<V>, rule: RewriteRule, initial: V, pairs: set<(V, V)>, isOkay: bool)
+requires initial in dfa.follow
+requires pairsInFollow(dfa, pairs)
+requires pairsAreSubsumed(dfa, pairs)
+requires isOkay ==> rewriteIntoPairs(dfa, rule, pairs)
+ensures 
+isOkay ==>
+  forall s, at | 0 <= at <= |s| - |rule.before| && s[at..at+|rule.before|] == rule.before && stringMatchesDFAFrom(dfa, s, initial) ::
+    stringMatchesDFAFrom(dfa, performRewriteAt(s, rule, at), initial) 
+{
+  if !isOkay {
+    return;
+  }
+  wholeDfaVertexEquivalence(dfa);
+  var vertexes := set v | v in dfa.follow;
+  forall s, at | 0 <= at <= |s| - |rule.before| && s[at..at+|rule.before|] == rule.before && stringMatchesDFAFrom(dfa, s, initial)
+  ensures stringMatchesDFAFrom(dfa, performRewriteAt(s, rule, at), initial)
+  {
+    var rewritten := performRewriteAt(s, rule, at);
+    stringMatchesDFAFromEventually(dfa, s, initial, at);
+    stringMatchesDFAFromEventually(dfa, rewritten, initial, at);
+    // At some point, just before the rewrite rule, we end at this vertex:
+    var lastCommonVertex := followStringFrom(dfa, s[..at], initial);
+    assert rewritten[..at] == s[..at];
+
+    // We know that following lastCommonVertex, we are accepted before:
+    assert stringMatchesDFAFrom(dfa, s[at..], lastCommonVertex);
+    // So we want to prove that following lastCommonVertex, we are accepted after the rewrite:
+    assert stringMatchesDFAFrom(dfa, rewritten[at..], lastCommonVertex) ==> stringMatchesDFAFrom(dfa, rewritten, initial);
+
+    var tailBefore := s[at..];
+    var tailAfter := rewritten[at..];
+    assert tailBefore[..|rule.before|] == rule.before;
+    assert tailAfter[..|rule.after|] == rule.after;
+
+    assert tailBefore[|rule.before|..] == tailAfter[|rule.after|..];
+    var commonEnd := tailBefore[|rule.before|..];
+
+    stringMatchesDFAFromEventually(dfa, tailBefore, lastCommonVertex, |rule.before|);
+    assert stringMatchesDFAFrom(dfa, tailBefore, lastCommonVertex) <==> stringMatchesDFAFrom(dfa, commonEnd, followStringFrom(dfa, rule.before, lastCommonVertex));
+
+    assert tailAfter[..|rule.after|] == rule.after;
+    stringMatchesDFAFromEventually(dfa, tailAfter, lastCommonVertex, |rule.after|);
+    assert stringMatchesDFAFrom(dfa, tailAfter, lastCommonVertex) <==> stringMatchesDFAFrom(dfa, commonEnd, followStringFrom(dfa, rule.after, lastCommonVertex));
+
+    var vertexThenBefore := followStringFrom(dfa, rule.before, lastCommonVertex);
+    var vertexThenAfter := followStringFrom(dfa, rule.after, lastCommonVertex);
+    assert lastCommonVertex in vertexes;
+    assert verifyPreservesRewriteProofTrigger(lastCommonVertex) == 0;
+    rewriteIntoPairsInstance(dfa, rule, pairs, lastCommonVertex);
+    assert (vertexThenBefore, vertexThenAfter) in pairs;
+
+
+    reveal pairsAreSubsumed();
+    assert stringMatchesDFAFrom(dfa, tailBefore[|rule.before|..], vertexThenBefore);
+    reveal vertexSubsumption();
+    
+    assert stringMatchesDFAFrom(dfa, rewritten[at..], lastCommonVertex);
+  }
+}
+
+function verifyPreservesRewriteTrigger(s: TapeString, at: int): int { 0 }
+
+function method {:opaque true} verifyPreservesRewrite<V(!new, ==)>(dfa: WholeDFA<V>, rule: RewriteRule, initial: V, pairs: set<(V, V)>): (isOkay: bool)
+requires initial in dfa.follow
+requires pairsInFollow(dfa, pairs)
+requires pairsAreSubsumed(dfa, pairs)
+ensures isOkay ==> forall s, at {:trigger verifyPreservesRewriteTrigger(s, at)} | 0 <= at <= |s| - |rule.before| && s[at..at+|rule.before|] == rule.before && stringMatchesDFAFrom(dfa, s, initial) :: stringMatchesDFAFrom(dfa, performRewriteAt(s, rule, at), initial)
+{
+  
+  wholeDfaVertexEquivalence(dfa);
+  var checked := checkAllRecursive(dfa.vertexList, (v: V) requires v in dfa.vertexList => 
+    (followStringFrom(dfa, rule.before, v), followStringFrom(dfa, rule.after, v)) in pairs
+  );
+  assert checked ==>
+    funcForAll(dfa.vertexList, (v: V) requires v in dfa.vertexList => (followStringFrom(dfa, rule.before, v), followStringFrom(dfa, rule.after, v)) in pairs)
+  ;
+  verifyPreservesRewriteProofHelper1(dfa, rule, pairs, checked);
+  verifyPreservesRewriteProof(dfa, rule, initial, pairs, checked);
+  checked
+}
+
+method verifyDfaPropertiesForProgram<V(!new, ==)>(program: Program, dfa: WholeDFA<V>, initialVertex: V, sinkAccept: V, sinkReject: V) returns (isOkay: bool)
+requires initialVertex in dfa.follow
+ensures isOkay ==> programLoopsForever(program)
+{
+  var allInputs := set b, c | b in [B0, B1] && c in [CA, CB, CC, CD, CE] :: Input(b, c);
+  forall input: Input ensures input in allInputs {
+    assert input.color == CA || input.color == CB || input.color == CC || input.color == CD || input.color == CE;
+    assert input.head == B0 || input.head == B1;
+  }
+
+  var allSymbols := methodAllTapeAlpha();
+  methodAllTapeAlphaWorks();
+  
+  if sinkAccept !in dfa.follow || sinkReject !in dfa.follow {
+    return false;
+  }
+  if sinkAccept !in dfa.accept || sinkReject in dfa.accept {
+    return false;
+  }
+
+  var isSinkAcceptOkay := checkAll(allSymbols, sym => wholeDfaWorks(dfa, sinkAccept, sym); dfa.follow[sinkAccept][sym] == sinkAccept);
+  if !isSinkAcceptOkay {
+    return false;
+  }
+
+  var isSinkRejectOkay := checkAll(allSymbols, sym => wholeDfaWorks(dfa, sinkReject, sym); dfa.follow[sinkReject][sym] == sinkReject);
+  if !isSinkRejectOkay {
+    return false;
+  }
+
+  var accepting := (s: (int, TapeString)) requires regularTape(s.1) => stringMatchesDFAFrom(dfa, s.1, initialVertex);
+
+  // Initial state matches:
+  assert (forall t: (int, TapeString) | regularTape(t.1) :: accepting.requires(t));
+  initialTapeString();
+  assert regularTape(InitialTapeString.1);
+  wholeDfaWorks(dfa, initialVertex, TapeEnd);
+  var vInitialTapeEnd := dfa.follow[initialVertex][TapeEnd];
+  assert stringMatchesDFAFrom(dfa, InitialTapeString.1, initialVertex) <==> stringMatchesDFAFrom(dfa, InitialTapeString.1[1..], vInitialTapeEnd);
+  wholeDfaWorks(dfa, vInitialTapeEnd, TapeHead(CA, B0));
+  var vInitialTapeEndAlpha := dfa.follow[vInitialTapeEnd][TapeHead(CA, B0)];
+  assert stringMatchesDFAFrom(dfa, InitialTapeString.1, initialVertex) <==> stringMatchesDFAFrom(dfa, InitialTapeString.1[2..], vInitialTapeEndAlpha);
+  wholeDfaWorks(dfa, vInitialTapeEndAlpha, TapeEnd);
+  var vInitialTapeStringEnd := dfa.follow[vInitialTapeEndAlpha][TapeEnd];
+  assert stringMatchesDFAFrom(dfa, InitialTapeString.1, initialVertex) <==> stringMatchesDFAFrom(dfa, InitialTapeString.1[3..], vInitialTapeStringEnd);
+  if vInitialTapeStringEnd !in dfa.accept {
+    return false;
+  }
+  assert stringMatchesDFAFrom(dfa, InitialTapeString.1, initialVertex);
+  assert accepting(InitialTapeString);
+
+  // Halting states are not accepted:
+  
+  var haltingInputs := set input: Input | input in allInputs && input !in program :: input;
+  var haltingInputPairs := set input: Input, v: V | input in haltingInputs && v in dfa.follow :: (input, v);
+  var haltingInputOkay := checkAll(haltingInputPairs, (p: (Input, V)) requires p.1 in dfa.follow => 
+    var input := p.0;
+    var v := p.1;
+    var inputSym := TapeHead(input.color, input.head);
+    wholeDfaWorks(dfa, v, inputSym);
+    dfa.follow[v][inputSym] == sinkReject
+  );
+  if !haltingInputOkay {
+    return false;
+  }
+
+  forall alpha: TapeAlpha, v: V | alpha.TapeHead? && Input(alpha.tapeHeadBit, alpha.tapeHeadState) in haltingInputs && v in dfa.follow
+  ensures alpha in dfa.follow[v] && dfa.follow[v][alpha] == sinkReject {
+    wholeDfaWorks(dfa, v, alpha);
+    assert (Input(alpha.tapeHeadBit, alpha.tapeHeadState), v) in haltingInputPairs;
+  }
+
+  forall t: (int, TapeString) | regularTape(t.1) && configInput(regularTapeConfig(t)) !in program ensures !accepting(t) {
+    var c := regularTapeConfig(t);
+    assert configInput(c) !in program;
+    var headIndex :| 0 <= headIndex < |t.1| && t.1[headIndex].TapeHead?;
+    assert configInput(c) == Input(t.1[headIndex].tapeHeadBit, t.1[headIndex].tapeHeadState);
+    stringMatchesDFAFromEventually(dfa, t.1, initialVertex, headIndex);
+    var vBeforeHead :| vBeforeHead in dfa.follow && (stringMatchesDFAFrom(dfa, t.1, initialVertex) <==> stringMatchesDFAFrom(dfa, t.1[headIndex..], vBeforeHead));
+    wholeDfaWorks(dfa, vBeforeHead, t.1[headIndex]);
+    assert configInput(c) in haltingInputs;
+    assert dfa.follow[vBeforeHead][t.1[headIndex]] == sinkReject;
+  }
+
+  forall t: (int, TapeString) | regularTape(t.1) && accepting(t) ensures configInput(regularTapeConfig(t)) in program {
+    // Immediate corrolary by contrapositive.
+  }
+
+  var programRewrites := programRewriteRules(program);
+  
+  // First, we prove that all accepted tapes are non-halting, so they have a rewrite rule:
+  forall t: (int, TapeString) | regularTape(t.1) && accepting(t) ensures 
+  exists rule, at :: rule in programRewrites && 0 <= at <= |t.1| - |rule.3.before|&&
+    t.1[at .. at + |rule.3.before|] == rule.3.before
+  {
+    var tape := t.1;
+    var i :| 1 <= i < |tape|-1 && tape[i].TapeHead? &&
+      forall j | (1 <= j < |tape|-1 && j != i) :: tape[j].TapeBit?;
+    var c := regularTapeConfig(t);
+    var input := configInput(c);
+    assert input in program;
+    var action := program[input];
+    if action.move == R {
+      if i != |tape| - 2 {
+        assert tape[i+1].TapeBit?;
+        var b := tape[i+1].tapeBit;
+        assert input in program;
+        var ruleMiddle := (0, input, action, MkRewriteRule([TapeHead(input.color, input.head), TapeBit(b)], [TapeBit(action.write), TapeHead(action.nextState, b)]));
+        assert b in [B0, B1];
+        programRewriteRuleRightMiddle(program, input, action, b);
+        assert ruleMiddle in programRewrites;
+        assert 0 <= i <= |tape| - |ruleMiddle.3.before|;
+        assert |ruleMiddle.3.before| == 2;
+        assert tape[i] == ruleMiddle.3.before[0];
+        assert tape[i+1] == ruleMiddle.3.before[1];
+        assert tape[i .. i + |ruleMiddle.3.before|] == ruleMiddle.3.before;
+
+        assert exists rule, at :: rule in programRewrites && 0 <= at <= |t.1| - |rule.3.before|&&
+          t.1[at .. at + |rule.3.before|] == rule.3.before;
+      } else {
+        var ruleEnd := (0, input, action, MkRewriteRule([TapeHead(input.color, input.head), TapeEnd], [TapeBit(action.write), TapeHead(action.nextState, B0), TapeEnd]));
+        assert tape[i+1].TapeEnd?;
+        assert input in program;
+        programRewriteRuleRightEnd(program, input, action);
+        assert ruleEnd in programRewrites;
+        assert |ruleEnd.3.before| == 2;
+        assert tape[i] == ruleEnd.3.before[0];
+        assert tape[i+1] == ruleEnd.3.before[1];
+        assert tape[i .. i + |ruleEnd.3.before|] == ruleEnd.3.before;
+
+        assert exists rule, at :: rule in programRewrites && 0 <= at <= |t.1| - |rule.3.before|&&
+          t.1[at .. at + |rule.3.before|] == rule.3.before;
+      }
+    } else {
+      if i != 1 {
+        assert tape[i-1].TapeBit?;
+        var b := tape[i-1].tapeBit;
+        assert input in program;
+        var ruleMiddle := (0, input, action, MkRewriteRule([TapeBit(b), TapeHead(input.color, input.head)], [TapeHead(action.nextState, b), TapeBit(action.write)]));
+        assert b in [B0, B1];
+        programRewriteRuleLeftMiddle(program, input, action, b);
+        assert ruleMiddle in programRewrites;
+        assert 0 <= i-1 <= |tape| - |ruleMiddle.3.before|;
+        assert |ruleMiddle.3.before| == 2;
+
+        var iBegin := i-1;
+        assert 0 <= iBegin <= |t.1| - |ruleMiddle.3.before|;
+        assert tape[iBegin] == ruleMiddle.3.before[0];
+        assert tape[iBegin+1] == ruleMiddle.3.before[1];
+        var slice := tape[iBegin .. iBegin + |ruleMiddle.3.before|];
+        assert |slice| == 2 == |ruleMiddle.3.before|;
+        assert slice[0] == ruleMiddle.3.before[0];
+        assert slice[1] == ruleMiddle.3.before[1];
+        assert tape[iBegin .. iBegin + |ruleMiddle.3.before|] == ruleMiddle.3.before;
+        assert 0 <= iBegin <= |tape| - |ruleMiddle.3.before|;
+
+        assert exists rule, at :: rule in programRewrites && 0 <= at <= |t.1| - |rule.3.before| &&
+          t.1[at .. at + |rule.3.before|] == rule.3.before;
+      } else {
+        var ruleEnd := (-1, input, action, MkRewriteRule([TapeEnd, TapeHead(input.color, input.head)], [TapeEnd, TapeHead(action.nextState, B0), TapeBit(action.write)]));
+        assert tape[i-1].TapeEnd?;
+        assert input in program;
+        programRewriteRuleLeftEnd(program, input, action);
+        assert ruleEnd in programRewrites;
+        assert |ruleEnd.3.before| == 2;
+        var iBegin := i-1;
+        assert 0 <= iBegin <= |t.1| - |ruleEnd.3.before|;
+        assert tape[iBegin] == ruleEnd.3.before[0];
+        assert tape[iBegin+1] == ruleEnd.3.before[1];
+        assert tape[iBegin .. iBegin + |ruleEnd.3.before|] == ruleEnd.3.before;
+
+        assert exists rule, at :: rule in programRewrites && 0 <= at <= |t.1| - |rule.3.before|&&
+          t.1[at .. at + |rule.3.before|] == rule.3.before;
+      }
+    }
+  }
+
+  var subsumptionPairs := computeDfaAcceptanceSubsets(dfa);
+
+  var allRuleRewritesOkay := checkAll(programRewrites, rule requires rule in programRewrites =>
+    verifyPreservesRewrite(dfa, rule.3, initialVertex, subsumptionPairs)
+  );
+  if !allRuleRewritesOkay {
+    return false;
+  }
+
+  forall t: (int, TapeString) | regularTape(t.1) && accepting(t) ensures
+  exists rule, at ::
+    rule in programRewriteRules(program) && 0 <= at <= |t.1| - |rule.3.before| &&
+    t.1[at .. at + |rule.3.before|] == rule.3.before &&
+    var rewritten := performRewriteAt(t.1, rule.3, at);
+    regularTape(rewritten) &&
+    accepting((t.0 + rule.0, rewritten))
+  {
+    var rule, at :| rule in programRewriteRules(program) && 0 <= at <= |t.1| - |rule.3.before| && t.1[at .. at + |rule.3.before|] == rule.3.before;
+    var rewritten := performRewriteAt(t.1, rule.3, at);
+    programRewriteRulesAdvance(program, t, rule, at); // If we use this rule, we get a regular string.
+    assert regularTape(rewritten);
+    assert verifyPreservesRewriteTrigger(t.1, at) == 0;
+    assert stringMatchesDFAFrom(dfa, rewritten, initialVertex);
+    assert accepting((t.0 + rule.0, rewritten));
+  }
+
+  assert forwardClosedSet(program, accepting);
+  closedStringSetImpliesLooping(program, accepting);
+  return true;
 }
